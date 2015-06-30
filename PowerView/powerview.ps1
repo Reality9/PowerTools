@@ -1309,9 +1309,6 @@ function Invoke-Ping {
  
                     [int]$MaxQueue,
  
-                [validatescript({Test-Path (Split-Path $_ -parent)})]
-                    [string]$LogFile = "C:\temp\log.log",
- 
                     [switch] $Quiet = $false
             )
     
@@ -1329,7 +1326,7 @@ function Invoke-Ping {
                     $script:MaxQueue = $MaxQueue
                 }
  
-                Write-Verbose "Throttle: '$throttle' SleepTimer '$sleepTimer' runSpaceTimeout '$runspaceTimeout' maxQueue '$maxQueue' logFile '$logFile'"
+                Write-Verbose "Throttle: '$throttle' SleepTimer '$sleepTimer' runSpaceTimeout '$runspaceTimeout' maxQueue '$maxQueue'"
  
                 #If they want to import variables or modules, create a clean runspace, get loaded items, use those to exclude items
                 if ($ImportVariables -or $ImportModules)
@@ -1454,11 +1451,6 @@ function Invoke-Ping {
                             ElseIf ($runspace.Runspace -ne $null ) {
                                 $log = $null
                                 $more = $true
-                            }
- 
-                            #log the results if a log file was indicated
-                            if($logFile -and $log){
-                                ($log | ConvertTo-Csv -Delimiter ";" -NoTypeInformation)[1] | out-file $LogFile -append
                             }
                         }
  
@@ -1600,25 +1592,6 @@ function Invoke-Ping {
                 if( $PSBoundParameters.ContainsKey("inputObject") ){
                     $global:__bound = $true
                 }
- 
-                #Set up log file if specified
-                if( $LogFile ){
-                    New-Item -ItemType file -path $logFile -force | Out-Null
-                    ("" | Select Date, Action, Runtime, Status, Details | ConvertTo-Csv -NoTypeInformation -Delimiter ";")[0] | Out-File $LogFile
-                }
- 
-                #write initial log entry
-                $log = "" | Select Date, Action, Runtime, Status, Details
-                    $log.Date = Get-Date
-                    $log.Action = "Batch processing started"
-                    $log.Runtime = $null
-                    $log.Status = "Started"
-                    $log.Details = $null
-                    if($logFile) {
-                        ($log | convertto-csv -Delimiter ";" -NoTypeInformation)[1] | Out-File $LogFile -Append
-                    }
- 
-                $timedOutTasks = $false
  
                 #endregion INIT
             }
@@ -1887,7 +1860,7 @@ function Convert-NameToSid {
 function Convert-SidToName {
     <#
     .SYNOPSIS
-    Converst a security identifier (SID) to a group/user name.
+    Converts a security identifier (SID) to a group/user name.
     
     .PARAMETER SID
     The SID to convert.
@@ -1908,6 +1881,60 @@ function Convert-SidToName {
             Write-Warning "invalid SID"
         }
     }
+}
+
+
+function Translate-NT4Name {
+    <#
+    .SYNOPSIS
+    Converts a user/group NT4 name (i.e. dev/john) to canonical format.
+    Based on Bill Stewart's code from this article: 
+        http://windowsitpro.com/active-directory/translating-active-directory-object-names-between-formats
+
+    .PARAMETER DomainObject
+    The user/groupname to convert
+
+    .PARAMETER DomainObject
+    The user/groupname to convert
+
+    .LINK
+    http://windowsitpro.com/active-directory/translating-active-directory-object-names-between-formats
+    #>
+    [CmdletBinding()]
+    param(
+        [String] $DomainObject,
+        [String] $Domain
+    )
+
+    if (-not $Domain) {
+        $domain = (Get-NetDomain).name
+    }
+
+    $DomainObject = $DomainObject -replace "/","\"
+
+    # Accessor functions to simplify calls to NameTranslate
+    function Invoke-Method([__ComObject] $object, [String] $method, $parameters) {
+        $output = $object.GetType().InvokeMember($method, "InvokeMethod", $NULL, $object, $parameters)
+        if ( $output ) { $output }
+    }
+    function Set-Property([__ComObject] $object, [String] $property, $parameters) {
+        [Void] $object.GetType().InvokeMember($property, "SetProperty", $NULL, $object, $parameters)
+    }
+
+    $Translate = new-object -comobject NameTranslate
+
+    try {
+        Invoke-Method $Translate "Init" (1, $Domain)
+    }
+    catch [System.Management.Automation.MethodInvocationException] { }
+
+    Set-Property $Translate "ChaseReferral" (0x60)
+
+    try {
+        Invoke-Method $Translate "Set" (3, $DomainObject)
+        (Invoke-Method $Translate "Get" (2))
+    }
+    catch [System.Management.Automation.MethodInvocationException] { }
 }
 
 
@@ -2179,12 +2206,6 @@ function Get-NetUser {
                     $dn = "OU=$OU,$dn"
                 }
 
-                # use the specified LDAP query string to query for users
-                if($Filter){
-                    Write-Verbose "LDAP: $Filter"
-                    $dn = $Filter
-                }
-
                 # if we could grab the primary DC for the current domain, use that for the query
                 if ($PrimaryDC){
                     $UserSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$PrimaryDC/$dn")
@@ -2198,6 +2219,10 @@ function Get-NetUser {
                 if($UserName){
                     # samAccountType=805306368 indicates user objects
                     $UserSearcher.filter="(&(samAccountType=805306368)(samAccountName=$UserName))"
+                }
+                elseif($Filter){
+                    # filter is something like (samAccountName=*blah*)
+                    $UserSearcher.filter="(&(samAccountType=805306368)$Filter)"
                 }
                 else{
                     $UserSearcher.filter='(&(samAccountType=805306368))'
@@ -2248,8 +2273,8 @@ function Get-NetUser {
             }
             # if we're specifying a specific LDAP query string
             elseif($Filter){
-                $UserSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$Filter")
-                $UserSearcher.filter='(&(samAccountType=805306368))'
+                # filter is something like (samAccountName=*blah*)
+                $UserSearcher = [adsisearcher]"(&(samAccountType=805306368)$Filter)"
             }
             else{
                 $UserSearcher = [adsisearcher]'(&(samAccountType=805306368))'
@@ -2659,7 +2684,7 @@ function Get-NetComputers {
             # eliminate that pesky 1000 system limit
             $CompSearcher.PageSize = 200
 
-            $CompSearcher.FindAll() | ForEach-Object {
+            $CompSearcher.FindAll() | ? {$_} | ForEach-Object {
                 $up = $true
                 if($Ping){
                     $up = Test-Server -Server $_.properties.dnshostname
@@ -2696,6 +2721,97 @@ function Get-NetComputers {
             }
         }
 
+    }
+}
+
+
+function Get-NetPrinters {
+    <#
+        .SYNOPSIS
+        Gets an array of all current computers objects in a domain.
+
+        .DESCRIPTION
+        This function utilizes adsisearcher to query the current AD context
+        for current computer objects. Based off of Carlos Perez's Audit.psm1
+        script in Posh-SecMod (link below).
+
+
+        .PARAMETER Domain
+        The domain to query for printers.
+
+        .OUTPUTS
+        System.Array. An array of found system objects.
+    #>
+
+    [CmdletBinding()]
+    Param (
+        [string]
+        $Domain
+    )
+
+    process {
+        # if a domain is specified, try to grab that domain
+        if ($Domain){
+
+            # try to grab the primary DC for the current domain
+            try{
+                $PrimaryDC = ([Array](Get-NetDomainControllers))[0].Name
+            }
+            catch{
+                $PrimaryDC = $Null
+            }
+
+            try {
+                $dn = "DC=$($Domain.Replace('.', ',DC='))"
+
+                # if we could grab the primary DC for the current domain, use that for the query
+                if($PrimaryDC){
+                    $CompSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$PrimaryDC/$dn")
+                }
+                else{
+                    # otherwise try to connect to the DC for the target domain
+                    $CompSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$dn")
+                }
+
+                $CompSearcher.filter="(objectCategory=printQueue)"
+
+            }
+            catch{
+                Write-Warning "The specified domain $Domain does not exist, could not be contacted, or there isn't an existing trust."
+            }
+        }
+        else{
+            # otherwise, use the current domain
+            $CompSearcher = [adsisearcher]"(objectCategory=printQueue)"
+        }
+
+        if ($CompSearcher){
+
+            # eliminate that pesky 1000 system limit
+            $CompSearcher.PageSize = 200
+
+            $CompSearcher.FindAll() | ? {$_} | ForEach-Object {
+                # return full data objects
+                $properties = $_.Properties
+                $out = New-Object psobject
+
+                $properties.PropertyNames | % {
+                    if ($_ -eq "objectsid"){
+                        # convert the SID to a string
+                        $out | Add-Member Noteproperty $_ ((New-Object System.Security.Principal.SecurityIdentifier($properties[$_][0],0)).Value)
+                    }
+                    elseif($_ -eq "objectguid"){
+                        # convert the GUID to a string
+                        $out | Add-Member Noteproperty $_ (New-Object Guid (,$properties[$_][0])).Guid
+                    }
+                    else {
+                        $out | Add-Member Noteproperty $_ $properties[$_][0]
+                    }
+                }
+                $out
+
+            }
+        }
     }
 }
 
@@ -3037,6 +3153,12 @@ function Get-NetGroup {
         .PARAMETER Domain
         The domain to query for group users.
 
+        .PARAMETER FullData
+        Switch. Returns full data objects instead of just group/users.
+
+        .PARAMETER Recurse
+        Switch. If the group member is a group, recursively try to query its members as well.
+
         .EXAMPLE
         > Get-NetGroup
         Returns the usernames that of members of the "Domain Admins" domain group.
@@ -3059,8 +3181,14 @@ function Get-NetGroup {
         [Switch]
         $FullData,
 
+        [Switch]
+        $Recurse,
+
         [string]
-        $Domain
+        $Domain,
+
+        [string]
+        $PrimaryDC
     )
 
     process {
@@ -3117,6 +3245,14 @@ function Get-NetGroup {
                             $properties = ([adsi]"LDAP://$_").Properties
                         }
 
+                        # check if the result is a user account- if not assume it's a group
+                        if ($properties.samAccountType -ne "805306368"){
+                            $isGroup = $True
+                        }
+                        else{
+                            $isGroup = $False
+                        }
+
                         $out = New-Object psobject
                         $out | add-member Noteproperty 'GroupDomain' $Domain
                         $out | Add-Member Noteproperty 'GroupName' $GroupFoundName
@@ -3124,41 +3260,74 @@ function Get-NetGroup {
                         if ($FullData){
                             $properties.PropertyNames | % {
                                 # TODO: errors on cross-domain users?
-                                if ($properties[$_].count -eq 1) {
-                                    $out | Add-Member Noteproperty $_ $properties[$_][0]
+                                if ($_ -eq "objectsid"){
+                                    # convert the SID to a string
+                                    $out | Add-Member Noteproperty $_ ((New-Object System.Security.Principal.SecurityIdentifier($properties[$_][0],0)).Value)
+                                }
+                                elseif($_ -eq "objectguid"){
+                                    # convert the GUID to a string
+                                    $out | Add-Member Noteproperty $_ (New-Object Guid (,$properties[$_][0])).Guid
                                 }
                                 else {
-                                    $out | Add-Member Noteproperty $_ $properties[$_]
+                                    if ($properties[$_].count -eq 1) {
+                                        $out | Add-Member Noteproperty $_ $properties[$_][0]
+                                    }
+                                    else {
+                                        $out | Add-Member Noteproperty $_ $properties[$_]
+                                    }
                                 }
                             }
                         }
                         else {
-                            $UserDN = $properties.distinguishedName[0]
+                            $MemberDN = $properties.distinguishedName[0]
                             # extract the FQDN from the Distinguished Name
-                            $UserDomain = $UserDN.subString($UserDN.IndexOf("DC=")) -replace 'DC=','' -replace ',','.'
+                            $MemberDomain = $MemberDN.subString($MemberDN.IndexOf("DC=")) -replace 'DC=','' -replace ',','.'
+
+                            if ($properties.samAccountType -ne "805306368"){
+                                $isGroup = $True
+                            }
+                            else{
+                                $isGroup = $False
+                            }
 
                             if ($properties.samAccountName){
                                 # forest users have the samAccountName set
-                                $userName = $properties.samAccountName[0]
+                                $MemberName = $properties.samAccountName[0]
                             }
                             else {
                                 # external trust users have a SID, so convert it
                                 try {
-                                    $userName = Convert-SidToName $properties.cn[0]
+                                    $MemberName = Convert-SidToName $properties.cn[0]
                                 }
                                 catch {
                                     # if there's a problem contacting the domain to resolve the SID
-                                    $userName = $properties.cn
+                                    $MemberName = $properties.cn
                                 }
                             }
-                            $out | add-member Noteproperty 'UserDomain' $userDomain
-                            $out | add-member Noteproperty 'UserName' $userName
-                            $out | add-member Noteproperty 'UserDN' $UserDN
+                            $out | add-member Noteproperty 'MemberDomain' $MemberDomain
+                            $out | add-member Noteproperty 'MemberName' $MemberName
+                            $out | add-member Noteproperty 'IsGroup' $IsGroup
+                            $out | add-member Noteproperty 'MemberDN' $MemberDN
                         }
+
                         $out
+
+                        if($Recurse) {
+                            # if we're recursiving and  the returned value isn't a user account, assume it's a group
+                            if($IsGroup){
+                                if($FullData){
+                                    Get-NetGroup -Domain $Domain -PrimaryDC $PrimaryDC -FullData -Recurse -GroupName $properties.SamAccountName[0]
+                                }
+                                else {
+                                    Get-NetGroup -Domain $Domain -PrimaryDC $PrimaryDC -Recurse -GroupName $properties.SamAccountName[0]
+                                }
+                            }
+                        }
                     }
                 }
-                catch {}
+                catch {
+                    write-verbose $_
+                }
             }
         }
     }
@@ -3251,6 +3420,9 @@ function Get-NetLocalGroup {
         .PARAMETER GroupName
         The local group name to query for users. If not given, it defaults to "Administrators"
 
+        .PARAMETER Recurse
+        Switch. If the local member member is a domain group, recursively try to resolve its members to get a list of domain users who can access this machine.
+
         .EXAMPLE
         > Get-NetLocalGroup
         Returns the usernames that of members of localgroup "Administrators" on the local host.
@@ -3258,6 +3430,11 @@ function Get-NetLocalGroup {
         .EXAMPLE
         > Get-NetLocalGroup -HostName WINDOWSXP
         Returns all the local administrator accounts for WINDOWSXP
+
+        .EXAMPLE
+        > Get-NetLocalGroup -HostName WINDOWS7 -Resurse 
+        Returns all effective local/domain users/groups that can access WINDOWS7 with
+        local administrative privileges.
 
         .LINK
         http://stackoverflow.com/questions/21288220/get-all-local-members-and-groups-displayed-together
@@ -3274,7 +3451,10 @@ function Get-NetLocalGroup {
         $HostList,
 
         [string]
-        $GroupName
+        $GroupName,
+
+        [switch]
+        $Recurse
     )
 
     process {
@@ -3310,17 +3490,37 @@ function Get-NetLocalGroup {
             try{
                 $members = @($([ADSI]"WinNT://$server/$groupname").psbase.Invoke('Members'))
                 $members | ForEach-Object {
-                    write-verbose $_
                     $out = New-Object psobject
                     $out | Add-Member Noteproperty 'Server' $Server
-                    $out | Add-Member Noteproperty 'AccountName' ( $_.GetType().InvokeMember('Adspath', 'GetProperty', $null, $_, $null)).Replace('WinNT://', '')
-                    # # translate the binary sid to a string
+
+                    $AdsPath = ($_.GetType().InvokeMember('Adspath', 'GetProperty', $null, $_, $null)).Replace('WinNT://', '')
+
+                    # try to translate the NT4 domain to a FQDN if possible
+                    $name = Translate-NT4Name $AdsPath
+                    if($name) {
+                        $fqdn = $name.split("/")[0]
+                        $objName = $AdsPath.split("/")[-1]
+                        $name = "$fqdn/$objName"
+                        $IsDomain = $True
+                    }
+                    else {
+                        $name = $AdsPath
+                        $IsDomain = $False
+                    }
+
+                    $out | Add-Member Noteproperty 'AccountName' $name
+
+                    # translate the binary sid to a string
                     $out | Add-Member Noteproperty 'SID' ((New-Object System.Security.Principal.SecurityIdentifier($_.GetType().InvokeMember('ObjectSID', 'GetProperty', $null, $_, $null),0)).Value)
-                    # # if the account is local, check if it's disabled, if it's domain, always print $false
-                    $out | Add-Member Noteproperty 'Disabled' $(if((($_.GetType().InvokeMember('Adspath', 'GetProperty', $null, $_, $null)).Replace('WinNT://', '')-like "*/$server/*")) {try{$_.GetType().InvokeMember('AccountDisabled', 'GetProperty', $null, $_, $null)} catch {'ERROR'} } else {$False} )
-                    # # check if the member is a group
+
+                    # if the account is local, check if it's disabled, if it's domain, always print $false
+                    # TODO: fix this error?
+                    $out | Add-Member Noteproperty 'Disabled' $( if(-not $IsDomain) { try { $_.GetType().InvokeMember('AccountDisabled', 'GetProperty', $null, $_, $null) } catch { 'ERROR' } } else { $False } )
+
+                    # check if the member is a group
                     $IsGroup = ($_.GetType().InvokeMember('Class', 'GetProperty', $Null, $_, $Null) -eq 'group')
                     $out | Add-Member Noteproperty 'IsGroup' $IsGroup
+                    $out | Add-Member Noteproperty 'IsDomain' $IsDomain
                     if($IsGroup){
                         $out | Add-Member Noteproperty 'LastLogin' ""
                     }
@@ -3333,6 +3533,52 @@ function Get-NetLocalGroup {
                         }
                     }
                     $out
+
+                    # if the result is a group domain object and we're recursing,
+                    # try to resolve all the group member results
+                    if($Recurse -and $IsDomain -and $IsGroup){
+                        Write-Verbose "recurse!"
+                        $FQDN = $name.split("/")[0]
+                        $GroupName = $name.split("/")[1]
+                        Get-NetGroup $GroupName -FullData -Recurse | % {
+                            $out = New-Object psobject
+                            $out | Add-Member Noteproperty 'Server' $name
+
+                            $MemberDN = $_.distinguishedName
+                            # extract the FQDN from the Distinguished Name
+                            $MemberDomain = $MemberDN.subString($MemberDN.IndexOf("DC=")) -replace 'DC=','' -replace ',','.'
+
+                            if ($_.samAccountType -ne "805306368"){
+                                $MemberIsGroup = $True
+                            }
+                            else{
+                                $MemberIsGroup = $False
+                            }
+
+                            if ($_.samAccountName){
+                                # forest users have the samAccountName set
+                                $MemberName = $_.samAccountName
+                            }
+                            else {
+                                # external trust users have a SID, so convert it
+                                try {
+                                    $MemberName = Convert-SidToName $_.cn
+                                }
+                                catch {
+                                    # if there's a problem contacting the domain to resolve the SID
+                                    $MemberName = $_.cn
+                                }
+                            }
+
+                            $out | Add-Member Noteproperty 'AccountName' "$MemberDomain/$MemberName"
+                            $out | Add-Member Noteproperty 'SID' $_.objectsid
+                            $out | Add-Member Noteproperty 'Disabled' $False
+                            $out | Add-Member Noteproperty 'IsGroup' $MemberIsGroup
+                            $out | Add-Member Noteproperty 'IsDomain' $True
+                            $out | Add-Member Noteproperty 'LastLogin' ''
+                            $out
+                        }
+                    }
                 }
             }
             catch {
@@ -4616,61 +4862,28 @@ function Get-UserProperties {
         $Properties
     )
 
-    # if properties are specified, return all values of it for all users
-    if ($Properties){
-        if ($Domain){
-            $users = Get-NetUser -Domain $Domain
-        }
-        else{
-            $users = Get-NetUser
-        }
-        $users | ForEach-Object {
+    if($Properties) {
+        # extract out the set of all properties for each object
+        Get-NetUser -Domain $Domain | % {
 
-            $props = @{}
-            $s = $_.Item('SamAccountName')
-            $props.Add('SamAccountName', "$s")
+            $out = new-object psobject
+            $out | add-member Noteproperty 'Name' $_.name
 
             if($Properties -isnot [system.array]){
                 $Properties = @($Properties)
             }
             foreach($Property in $Properties){
-                $p = $_.Item($Property)
-                $props.Add($Property, "$p")
+                try {
+                    $out | add-member Noteproperty $Property $_.$Property
+                }
+                catch {}
             }
-            [pscustomobject] $props
+            $out
         }
-
     }
     else{
-        # otherwise return all the property names themselves
-        if ($Domain){
-
-            # try to grab the primary DC for the current domain
-            try{
-                $PrimaryDC = ([Array](Get-NetDomainControllers))[0].Name
-            }
-            catch{
-                $PrimaryDC = $Null
-            }
-
-            $dn = "DC=$($Domain.Replace('.', ',DC='))"
-
-            # if we could grab the primary DC for the current domain, use that for the query
-            if($PrimaryDC){
-                $UserSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$PrimaryDC/$dn")
-            }
-            else{
-                # otherwise try to connect to the DC for the target domain
-                $UserSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$dn")
-            }
-
-            # samAccountType=805306368 indicates user objects
-            $UserSearcher.filter = '(&(samAccountType=805306368))'
-            (($UserSearcher.FindAll())[0].properties).PropertyNames
-        }
-        else{
-            ((([adsisearcher]'objectCategory=User').Findall())[0].properties).PropertyNames
-        }
+        # extract out just the property names
+        Get-NetUser -Domain $Domain | Select -first 1 | Get-Member -MemberType *Property | Select-Object -Property "Name"
     }
 }
 
@@ -4721,62 +4934,29 @@ function Get-ComputerProperties {
         $Properties
     )
 
-    # if a domain is specified, try to grab that domain
-    if ($Domain){
+    if($Properties) {
+        # extract out the set of all properties for each object
+        Get-NetComputers -Domain $Domain -FullData | % {
 
-        # try to grab the primary DC for the current domain
-        try{
-            $PrimaryDC = ([Array](Get-NetDomainControllers))[0].Name
-        }
-        catch{
-            $PrimaryDC = $Null
-        }
+            $out = new-object psobject
+            $out | add-member Noteproperty 'Name' $_.name
 
-        try {
-            $dn = "DC=$($Domain.Replace('.', ',DC='))"
-
-            if($PrimaryDC){
-                $CompSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$PrimaryDC/$dn")
+            if($Properties -isnot [system.array]){
+                $Properties = @($Properties)
             }
-            else{
-                $CompSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$dn")
+            foreach($Property in $Properties){
+                try {
+                    $out | add-member Noteproperty $Property $_.$Property
+                }
+                catch {}
             }
-            $CompSearcher.filter='(&(objectClass=Computer))'
-
-        }
-        catch{
-            Write-Warning "The specified domain $Domain does not exist, could not be contacted, or there isn't an existing trust."
+            $out
         }
     }
     else{
-        $CompSearcher = [adsisearcher]'(&(objectClass=Computer))'
+        # extract out just the property names
+        Get-NetComputers -Domain $Domain -FullData | Select -first 1 | Get-Member -MemberType *Property | Select-Object -Property "Name"
     }
-
-
-    if ($CompSearcher){
-        # if specific property names were passed, try to extract those
-        if ($Properties){
-            $CompSearcher.FindAll() | ForEach-Object {
-                $props = @{}
-                $s = $_.Properties.name
-                $props.Add('Name', "$s")
-
-                if($Properties -isnot [system.array]){
-                    $Properties = @($Properties)
-                }
-                foreach($Property in $Properties){
-                    $p = $_.Properties.$Property
-                    $props.Add($Property, "$p")
-                }
-                [pscustomobject] $props
-            }
-        }
-        else{
-            # otherwise return all property names
-            (($CompSearcher.FindAll())[0].properties).PropertyNames
-        }
-    }
-
 }
 
 
@@ -5703,6 +5883,9 @@ function Invoke-UserHunter {
         .PARAMETER GroupName
         Group name to query for target users.
 
+        .PARAMETER TargetServerAdmins
+        Hunt for users who are effective local admins on a target server.
+
         .PARAMETER OU
         The OU to pull users from.
 
@@ -5756,6 +5939,11 @@ function Invoke-UserHunter {
         logged into with a 60 second (+/- *.3) randomized delay between
         touching each host.
 
+        .EXAMPLE
+        > Invoke-UserHunter -TargetServerAdmins FILESERVER
+        Query FILESERVER for useres who are effective local administrators using
+        Get-NetLocalGroup -Recurse, and hunt for that user set on the network.
+
         .LINK
         http://blog.harmj0y.net
     #>
@@ -5774,6 +5962,9 @@ function Invoke-UserHunter {
 
         [string]
         $GroupName = 'Domain Admins',
+
+        [string]
+        $TargetServerAdmins,
 
         [string]
         $OU,
@@ -5855,6 +6046,10 @@ function Invoke-UserHunter {
 
         # if we're showing all results, skip username enumeration
         if($ShowAll){}
+        # if we want to hunt for the effective domain users who can access a target server
+        elseif($TargetServerAdmins){
+            $TargetUsers = Get-NetLocalGroup WINDOWS4.dev.testlab.local -Recurse | ?{(-not $_.IsGroup) -and $_.IsDomain} | %{ ($_.AccountName).split("/")[1].toLower() }
+        }
         # if we get a specific username, only use that
         elseif ($UserName){
             Write-Verbose "[*] Using target user '$UserName'..."
@@ -5883,7 +6078,7 @@ function Invoke-UserHunter {
         else{
             # otherwise default to the group name to query for target users
             Write-Verbose "[*] Querying domain group '$GroupName' for target users..."
-            $temp = Get-NetGroup -GroupName $GroupName -Domain $targetDomain | % {$_.UserName}
+            $temp = Get-NetGroup -GroupName $GroupName -Domain $targetDomain | % {$_.MemberName}
             # lower case all of the found usernames
             $TargetUsers = $temp | ForEach-Object {$_.ToLower() }
         }
@@ -6206,7 +6401,7 @@ function Invoke-UserHunterThreaded {
         else{
             # otherwise default to the group name to query for target users
             Write-Verbose "[*] Querying domain group '$GroupName' for target users..."
-            $temp = Get-NetGroup -GroupName $GroupName -Domain $targetDomain | % {$_.UserName}
+            $temp = Get-NetGroup -GroupName $GroupName -Domain $targetDomain | % {$_.MemberName}
             # lower case all of the found usernames
             $TargetUsers = $temp | ForEach-Object {$_.ToLower() }
         }
@@ -6433,6 +6628,9 @@ function Invoke-StealthUserHunter {
         .PARAMETER GroupName
         Group name to query for target users.
 
+        .PARAMETER TargetServerAdmins
+        Hunt for users who are effective local admins on a target server.
+
         .PARAMETER OU
         OU to query for target users.
 
@@ -6497,6 +6695,11 @@ function Invoke-StealthUserHunter {
         have sessions with a 60 second (+/- *.3) randomized delay between
         touching each file server.
 
+        .EXAMPLE
+        > Invoke-StealthUserHunter -TargetServerAdmins FILESERVER
+        Query FILESERVER for useres who are effective local administrators using
+        Get-NetLocalGroup -Recurse, and hunt for that user set on the network.
+
         .LINK
         http://blog.harmj0y.net
     #>
@@ -6512,6 +6715,9 @@ function Invoke-StealthUserHunter {
 
         [string]
         $GroupName = 'Domain Admins',
+
+        [string]
+        $TargetServerAdmins,
 
         [string]
         $OU,
@@ -6588,6 +6794,10 @@ function Invoke-StealthUserHunter {
 
         # if we're showing all results, skip username enumeration
         if($ShowAll){}
+        # if we want to hunt for the effective domain users who can access a target server
+        elseif($TargetServerAdmins){
+            $TargetUsers = Get-NetLocalGroup WINDOWS4.dev.testlab.local -Recurse | ?{(-not $_.IsGroup) -and $_.IsDomain} | %{ ($_.AccountName).split("/")[1].toLower() }
+        }
         # if we get a specific username, only use that
         elseif ($UserName){
             Write-Verbose "[*] Using target user '$UserName'..."
@@ -6616,7 +6826,7 @@ function Invoke-StealthUserHunter {
         else{
             # otherwise default to the group name to query for target users
             Write-Verbose "[*] Querying domain group '$GroupName' for target users..."
-            $temp = Get-NetGroup -GroupName $GroupName -Domain $targetDomain | % {$_.UserName}
+            $temp = Get-NetGroup -GroupName $GroupName -Domain $targetDomain | % {$_.MemberName}
             # lower case all of the found usernames
             $TargetUsers = $temp | ForEach-Object {$_.ToLower() }
         }
@@ -6942,7 +7152,7 @@ function Invoke-UserProcessHunter {
         }
         else{
             # otherwise default to the group name to query for target users
-            $temp = Get-NetGroup -GroupName $GroupName -Domain $targetDomain | % {$_.UserName}
+            $temp = Get-NetGroup -GroupName $GroupName -Domain $targetDomain | % {$_.MemberName}
             # lower case all of the found usernames
             $TargetUsers = $temp | ForEach-Object {$_.ToLower() }
         }
@@ -7517,7 +7727,7 @@ function Invoke-UserEventHunter {
     }
     else{
         # otherwise default to the group name to query for target users
-        $temp = Get-NetGroup -GroupName $GroupName -Domain $Domain | % {$_.UserName}
+        $temp = Get-NetGroup -GroupName $GroupName -Domain $Domain | % {$_.MemberName}
         # lower case all of the found usernames
         $TargetUsers = $temp | ForEach-Object {$_.ToLower() }
     }
@@ -9386,27 +9596,20 @@ function Invoke-UserFieldSearch {
         $Domain
     )
 
-    if ($Domain){
-        $users = Get-NetUser -Domain $Domain
-    }
-    else{
-        $users = Get-NetUser
-    }
-
-    foreach ($user in $users){
-
-        $desc = $user.($Field)
-
-        if ($desc){
-            $desc = $desc[0].ToString().ToLower()
+    Get-NetUser -Domain $Domain | % {
+        try {
+            $desc = $_.$Field
+            if ($desc){
+                $desc = $desc.ToString().ToLower()
+            }
+            if ( ($desc -ne $null) -and ($desc.Contains($Term.ToLower())) ) {
+                $out = new-object psobject
+                $out | add-member Noteproperty 'User' $_.samaccountname
+                $out | add-member Noteproperty $Field $desc
+                $out
+            }
         }
-        if ( ($desc -ne $null) -and ($desc.Contains($Term.ToLower())) ){
-            $u = $user.samaccountname[0]
-            $out = New-Object System.Collections.Specialized.OrderedDictionary
-            $out.add('User', $u)
-            $out.add($Field, $desc)
-            $out
-        }
+        catch {}
     }
 }
 
@@ -9447,60 +9650,22 @@ function Invoke-ComputerFieldSearch {
         $Domain
     )
 
-    # if a domain is specified, try to grab that domain
-    if ($Domain){
-        # try to grab the primary DC for the current domain
-        try{
-            $PrimaryDC = ([Array](Get-NetDomainControllers))[0].Name
-        }
-        catch{
-            $PrimaryDC = $Null
-        }
 
+    Get-NetComputers -Domain $Domain -FullData | % {
         try {
-            $dn = "DC=$($Domain.Replace('.', ',DC='))"
-
-            # if we could grab the primary DC for the current domain, use that for the query
-            if($PrimaryDC){
-                $CompSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$PrimaryDC/$dn")
-            }
-            else{
-                # otherwise try to connect to the DC for the target domain
-                $CompSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$dn")
-            }
-            $CompSearcher.filter='(&(objectClass=Computer))'
-
-        }
-        catch{
-            Write-Warning "The specified domain $Domain does not exist, could not be contacted, or there isn't an existing trust."
-        }
-    }
-    else{
-        $CompSearcher = [adsisearcher]'(&(objectClass=Computer))'
-    }
-
-    if ($CompSearcher){
-
-        # eliminate that pesky 1000 system limit
-        $CompSearcher.PageSize = 200
-
-        $CompSearcher.FindAll() | ForEach-Object {
-
-            $desc = $_.Properties.$Field
-
+            $desc = $_.$Field
             if ($desc){
-                $desc = $desc[0].ToString().ToLower()
+                $desc = $desc.ToString().ToLower()
             }
-            if ( ($desc -ne $null) -and ($desc.Contains($Term.ToLower())) ){
-                $c = $_.Properties.name
-                $out = New-Object System.Collections.Specialized.OrderedDictionary
-                $out.add('Computer', $c)
-                $out.add($Field, $desc)
+            if ( ($desc -ne $null) -and ($desc.Contains($Term.ToLower())) ) {
+                $out = new-object psobject
+                $out | add-member Noteproperty 'Name' $_.name
+                $out | add-member Noteproperty $Field $desc
                 $out
             }
         }
+        catch {}
     }
-
 }
 
 
@@ -10708,10 +10873,12 @@ function Invoke-FindUserTrustGroups {
         foreach ($membership in $_.memberof) {
             $index = $membership.IndexOf("DC=")
             if($index) {
-                if($GroupDN -ne $DistinguishedDomainName){
-                    $GroupDomain = $($membership.substring($index)) -replace 'DC=','' -replace ',','.'
-                    $GroupName = $membership.split(",")[0].split("=")[1]
+                
+                $GroupDomain = $($membership.substring($index)) -replace 'DC=','' -replace ',','.'
+                
+                if ($GroupDomain.CompareTo($Domain)) {
 
+                    $GroupName = $membership.split(",")[0].split("=")[1]
                     $out = new-object psobject
                     $out | add-member Noteproperty 'UserDomain' $Domain
                     $out | add-member Noteproperty 'UserName' $_.samaccountname
